@@ -4432,6 +4432,7 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	// envelope: the 401 (or 429 …) it stands for, so the next key or
 	// member is asked and the agent told why (@xanahopper on X)
 	res = notAnAPIReply(clineUnwrapped(p, provider.ZhipuEnveloped(req, res)), "")
+	res = miniMaxFormatError(p, to, body, res)
 	if p.Account != nil && p.Account.Agent == "codex" {
 		// a large request ChatGPT closed the connection on: asked again,
 		// nobody resting for it, and said what may help (#1628)

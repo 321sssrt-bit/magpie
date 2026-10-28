@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "error": {
+    "type": "bad_request_error",
+    "message": "invalid params, Mismatch type string with value array \"at index 952: mismatched type with value\\n\\n\\tslug\\\": {\\\"type\\\": [\\\"string\\\", \\\"null\\n\\t................^...............\\n\" (2013)",
+    "http_code": "400"
+  },
+  "request_id": "07313ba5d08aca57d17227da98e62f1a"
+}
