@@ -27,6 +27,8 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
@@ -65,6 +67,14 @@ type CLI struct {
 	// 0.162.1 listed with no codex on PATH and no ~/.codex). False when
 	// the terminal's PATH can't be told.
 	OffPath bool `json:"offPath,omitempty"`
+	// InDesktop: no Claude Code of its own is found here, and Claude
+	// Desktop is, which includes one for its Code tab that reads the
+	// same ~/.claude (cybercaius: the card stayed after Claude Code was
+	// uninstalled and Desktop installed again, with nothing saying why).
+	// DesktopVersion is that copy's newest version, "" until Desktop has
+	// fetched it.
+	InDesktop      bool   `json:"inDesktop,omitempty"`
+	DesktopVersion string `json:"desktopVersion,omitempty"`
 }
 
 // cliSpec is where an agent's CLI is published.
@@ -96,10 +106,25 @@ type cliSpec struct {
 	// only are the systems (GOOS) its vendor builds it for, when not all:
 	// on any other its package installs nothing that runs
 	only []string
+	// scripts: its npm package's install script is what makes it run
+	// (OpenCode's postinstall puts the platform's binary in place of a stub
+	// that only says "@opencode/cli's postinstall script was not run"),
+	// and npm 12, bun and pnpm 10 run a package's install script only for
+	// one they are told to: npm install -g --allow-scripts=<pkg>, bun add
+	// -g --trust, pnpm add -g --allow-build=<pkg>. npm 10 and 11 run it
+	// anyway, and take --allow-scripts as a config they don't know.
+	scripts bool
+	// line is the npm package of the line version is in, for a CLI whose
+	// own updater (self) stays on its line: OpenCode 1's opencode upgrade
+	// runs opencode.ai/install, which installs OpenCode 1 only and refuses
+	// a 2.x version, so an OpenCode 1 from that installer is told
+	// opencode-ai's newest, an OpenCode 2 @opencode/cli's. "" when the
+	// version isn't known: no version is promised.
+	line func(version string) string
 }
 
 var cliSpecs = map[string]cliSpec{
-	"claude": {npm: []string{"@anthropic-ai/claude-code"}, brew: []string{"claude-code"},
+	"claude": {npm: []string{"@anthropic-ai/claude-code"}, brew: []string{"claude-code"}, scripts: true,
 		self: func(bin, real string) []string {
 			// ~/.local/bin/claude → ~/.local/share/claude/versions/2.1.3;
 			// on Windows the binary itself, in ~/.local/bin
@@ -125,14 +150,31 @@ var cliSpecs = map[string]cliSpec{
 	// both of which deveco upgrade replaces
 	// Its npm package carries macOS and Windows binaries only (and
 	// OpenHarmony's), none for Linux.
-	"deveco": {npm: []string{"@deveco/deveco-code"}, only: []string{"darwin", "windows"},
+	"deveco": {npm: []string{"@deveco/deveco-code"}, only: []string{"darwin", "windows"}, scripts: true,
 		self: func(bin, real string) []string {
 			if strings.Contains(real, "/.local/share/deveco/versions/") || strings.HasSuffix(strings.ToLower(real), "/.local/bin/deveco.exe") {
 				return []string{bin, "upgrade"}
 			}
 			return nil
 		}},
-	"opencode": {npm: []string{"opencode-ai"}, brew: []string{"opencode"}, target: true,
+	// OpenCode 2 is @opencode/cli on npm (opencode-ai has OpenCode 1
+	// only, its latest 1.19.5 while @opencode/cli's is 2.2.5, 2026-11-05;
+	// math_milian on Discord), its installer opencode.ai/v2/install, which
+	// puts it in ~/.opencode/bin as OpenCode 1's did, and Homebrew's
+	// opencode formula (2.2.0) or anomalyco/tap's opencode-v2. An install
+	// of either package is updated on its own: npm, bun and pnpm keep it
+	// to its package, and line keeps opencode upgrade to its version's.
+	"opencode": {npm: []string{"@opencode/cli", "opencode-ai"}, brew: []string{"opencode", "opencode-v2"}, target: true, scripts: true,
+		line: func(v string) string {
+			major, _, _ := strings.Cut(strings.TrimPrefix(v, "v"), ".")
+			switch n, err := strconv.Atoi(major); {
+			case err != nil:
+				return ""
+			case n < 2:
+				return "opencode-ai"
+			}
+			return "@opencode/cli"
+		},
 		self: func(bin, real string) []string {
 			if strings.Contains(real, "/.opencode/bin/") {
 				return []string{bin, "upgrade"}
@@ -166,8 +208,8 @@ var cliSpecs = map[string]cliSpec{
 			return nil
 		}},
 	"copilot":   {npm: []string{"@github/copilot"}, brew: []string{"copilot-cli"}},
-	"crush":     {npm: []string{"@charmland/crush"}, brew: []string{"crush"}},
-	"cline":     {npm: []string{"cline"}, brew: []string{"cline"}},
+	"crush":     {npm: []string{"@charmland/crush"}, brew: []string{"crush"}, scripts: true},
+	"cline":     {npm: []string{"cline"}, brew: []string{"cline"}, scripts: true},
 	"dsh":       {npm: []string{"@deepseek-ai/dsh"}},
 	"codebuddy": {npm: []string{"@tencent-ai/codebuddy-code"}},
 	"goose":     {brew: []string{"block-goose-cli"}},
@@ -183,10 +225,10 @@ var cliSpecs = map[string]cliSpec{
 	// only its npm package and brew cask are recognized
 	"atomcode": {npm: []string{"@atomgit.com/atomcode"}, brew: []string{"atomcode"}},
 	// Snow CLI is published on npm alone (snow-ai)
-	"snow": {npm: []string{"snow-ai"}},
+	"snow": {npm: []string{"snow-ai"}, scripts: true},
 	// MothX: its npm installer package, which brings the native binary
 	// for the platform as an optional dependency
-	"mothx": {npm: []string{"mothx-installer"}},
+	"mothx": {npm: []string{"mothx-installer"}, scripts: true},
 	// PenguinHarness: its npm package, or install.sh's tarball in
 	// ~/.penguin (bin, lib, node; ~/.local/bin/penguin links there), which
 	// penguin update re-runs the installer for. On Windows its update
@@ -204,7 +246,7 @@ var cliSpecs = map[string]cliSpec{
 		}},
 	// omo update, however it was installed: OmO's own updater, which moves
 	// the engine it pins (senpi) with it
-	"omo": {npm: []string{"omo-ai"},
+	"omo": {npm: []string{"omo-ai"}, scripts: true,
 		self: func(bin, real string) []string { return []string{bin, "update"} }},
 }
 
@@ -270,7 +312,7 @@ func howInstalled(spec cliSpec, bin string) *updater {
 	// otherwise a package manager's before Homebrew's: npm under Homebrew's
 	// node (a keg-only node@20's Cellar/node@20/<v>/lib/node_modules) is npm's
 	for _, pkg := range spec.npm {
-		if u := fromNodeModules(pkg, bin, slash); u != nil {
+		if u := fromNodeModules(pkg, spec.scripts, bin, slash); u != nil {
 			return u
 		}
 	}
@@ -286,7 +328,7 @@ func howInstalled(spec cliSpec, bin string) *updater {
 // that runs it, so the folder holds that node too.
 func selfPath(spec cliSpec, bin, real string) string {
 	for _, pkg := range spec.npm {
-		if u := fromNodeModules(pkg, bin, real); u != nil {
+		if u := fromNodeModules(pkg, false, bin, real); u != nil {
 			if u.via == "npm" {
 				return u.path
 			}
@@ -346,7 +388,8 @@ func brewBin(spec cliSpec) string {
 // fromNodeModules is the updater of a CLI the package pkg installed in a
 // global node_modules: the binary leads there (npm's and bun's links), or
 // is a shim that names it (npm's .cmd on Windows, pnpm's scripts).
-func fromNodeModules(pkg, bin, real string) *updater {
+// scripts: the package's install script is let run (cliSpec.scripts).
+func fromNodeModules(pkg string, scripts bool, bin, real string) *updater {
 	mark := "/node_modules/" + pkg + "/"
 	modules := ""
 	if i := strings.Index(real, mark); i >= 0 {
@@ -369,13 +412,13 @@ func fromNodeModules(pkg, bin, real string) *updater {
 				return nil
 			}
 		}
-		return &updater{via: "bun", pkg: pkg, cmd: []string{bun, "add", "-g", pkg + "@latest"}}
+		return &updater{via: "bun", pkg: pkg, cmd: withScripts([]string{bun, "add", "-g"}, "bun", pkg, scripts)}
 	case strings.Contains(lower, "/pnpm/") || strings.Contains(lower, "/.pnpm/"):
 		pnpm, err := proc.Look("pnpm")
 		if err != nil {
 			return nil
 		}
-		return &updater{via: "pnpm", pkg: pkg, cmd: []string{pnpm, "add", "-g", pkg + "@latest"}}
+		return &updater{via: "pnpm", pkg: pkg, cmd: withScripts([]string{pnpm, "add", "-g"}, "pnpm", pkg, scripts)}
 	case strings.Contains(lower, "/.volta/") || strings.Contains(lower, "/yarn/") || strings.Contains(lower, "/.yarn/"):
 		return nil // installed by a manager of its own, which magpie leaves to it
 	}
@@ -411,8 +454,25 @@ func fromNodeModules(pkg, bin, real string) *updater {
 			return nil
 		}
 	}
-	u.cmd = []string{npm, "install", "-g", "--prefix", prefix, pkg + "@latest"}
+	u.cmd = withScripts([]string{npm, "install", "-g", "--prefix", prefix}, "npm", pkg, scripts)
 	return u
+}
+
+// withScripts is cmd, a package manager's global install, followed by
+// what lets pkg's install script run when scripts (cliSpec.scripts),
+// then pkg@latest, last: a retry puts another version there.
+func withScripts(cmd []string, via, pkg string, scripts bool) []string {
+	if scripts {
+		switch via {
+		case "npm":
+			cmd = append(cmd, "--allow-scripts="+pkg)
+		case "bun":
+			cmd = append(cmd, "--trust")
+		case "pnpm":
+			cmd = append(cmd, "--allow-build="+pkg)
+		}
+	}
+	return append(cmd, pkg+"@latest")
 }
 
 // bunxNames says whether bin is bun's Windows shim of pkg's program: a
@@ -661,7 +721,7 @@ var grokReleases = []string{"https://x.ai/cli/", "https://storage.googleapis.com
 // installer's GROK_CHANNEL or grok update --alpha, kept under [cli] in its
 // config.toml (stable when none).
 func grokLatest() string {
-	dir := os.Getenv("GROK_HOME")
+	dir := appdir.Getenv("GROK_HOME")
 	if dir == "" {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".grok")
@@ -796,16 +856,39 @@ func (a *Agent) cliBin() (string, cliSpec) {
 		return "", spec
 	}
 	bin := binAt(a.Bin)
-	if bin == "" {
-		bin = proc.FindTool(a.Bin)
-	}
-	if bin == "" {
-		return "", spec
+	if !a.binsOwn(bin) {
+		// a launcher of another program's is not the CLI: where else a
+		// user's tools are installed, then (VS Code's copilot shim, #3269)
+		if at := proc.FindTool(a.Bin); a.binsOwn(at) {
+			bin = at
+		} else {
+			return "", spec
+		}
 	}
 	if abs, err := filepath.Abs(bin); err == nil {
 		bin = abs
 	}
 	return bin, spec
+}
+
+// BinPath is where the agent's own program is, as Detected finds its Bin,
+// else where cliBin looks for one with no Bin (Grok Build's); "" for an
+// agent in a WSL distro and one with no program here (a desktop app).
+func (a *Agent) BinPath() string {
+	if a.WSL != "" {
+		return ""
+	}
+	if a.Bin == "" {
+		bin, _ := a.cliBin()
+		return bin
+	}
+	if bin := binAt(a.Bin); a.binsOwn(bin) {
+		return bin
+	}
+	if bin := proc.FindTool(a.Bin); a.binsOwn(bin) {
+		return bin
+	}
+	return ""
 }
 
 // CLI is the agent's CLI: its version, the newest, and whether magpie can
@@ -815,7 +898,10 @@ func (a *Agent) CLI() (c CLI, ok bool) {
 	c.App = a.AppVersion()
 	bin, spec := a.cliBin()
 	if bin == "" {
-		return c, c.App != ""
+		if a.ID == "claude" && a.WSL == "" {
+			c.InDesktop, c.DesktopVersion = claudeInDesktop()
+		}
+		return c, c.App != "" || c.InDesktop
 	}
 	real, u := installedAt(spec, bin)
 	c.Version = installedVersion(real)
@@ -828,6 +914,28 @@ func (a *Agent) CLI() (c CLI, ok bool) {
 	c.Latest = latestVersion(u)
 	c.Update = c.Version != "" && c.Latest != "" && Newer(c.Latest, c.Version)
 	return c, true
+}
+
+// claudeInDesktop says whether Claude Desktop is here, with the newest
+// Claude Code it keeps for its Code tab (desktopdir.ClaudeCode): its
+// bundle on a Mac, its folders or its install elsewhere (its detect).
+func claudeInDesktop() (here bool, version string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false, ""
+	}
+	for _, v := range desktopdir.ClaudeCode(desktopdir.OS, home, os.Getenv) {
+		if version == "" || Newer(v, version) {
+			version = v
+		}
+	}
+	if version != "" {
+		return true, version
+	}
+	if desktopdir.OS == "darwin" {
+		return appHere("Claude.app"), ""
+	}
+	return claudeDesktop(home).Detected(), ""
 }
 
 // InstalledVersion is what the agent's CLI on PATH says its version is: ""
@@ -1084,6 +1192,17 @@ var runCheck = func(ctx context.Context, bin string, env []string) (string, int,
 	return string(out), code, err
 }
 
+// scriptsFlag is the flag u's update lets its package's install script
+// run with (withScripts), and a space; "" for none.
+func scriptsFlag(u *updater) string {
+	for _, a := range u.cmd {
+		if a == "--trust" || strings.HasPrefix(a, "--allow-scripts=") || strings.HasPrefix(a, "--allow-build=") {
+			return a + " "
+		}
+	}
+	return ""
+}
+
 // mendHint is how to put back a CLI an update left unable to run.
 func mendHint(u *updater, version string) string {
 	at := version
@@ -1096,9 +1215,9 @@ func mendHint(u *updater, version string) string {
 		if strings.ContainsAny(prefix, " \t") {
 			prefix = `"` + prefix + `"`
 		}
-		return fmt.Sprintf("its install is incomplete (npm can leave out a native package and still succeed); reinstall it with: npm install -g --prefix %s %s@%s --include=optional", prefix, u.pkg, at)
+		return fmt.Sprintf("its install is incomplete (npm can leave out a native package and still succeed); reinstall it with: npm install -g --prefix %s %s%s@%s --include=optional", prefix, scriptsFlag(u), u.pkg, at)
 	case "bun", "pnpm":
-		return fmt.Sprintf("its install is incomplete; reinstall it with: %s add -g %s@%s", u.via, u.pkg, at)
+		return fmt.Sprintf("its install is incomplete; reinstall it with: %s add -g %s%s@%s", u.via, scriptsFlag(u), u.pkg, at)
 	case "brew":
 		cask := ""
 		if u.cask {

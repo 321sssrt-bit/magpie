@@ -260,6 +260,12 @@ writes it.**
 - Before adding a list or status route, find who writes each field it
   reads and under which lock. Run its test under -race with a delay
   injected into the writer.
+- The fix moved when the pid shows, and the test waiting on it wasn't
+  re-read: TestClaudeRunsNamesEachProcess took a listing, then read the
+  fake's hang.pid, and could end on a list made before the tree was set
+  (PID 0), red on CI at 5bfd76cd8. 3dd59428e waits for a run listed
+  with that pid; red 3 of 3 with a sleep injected in the listing before.
+  A change to when a value appears re-reads every wait on it.
 - Seen 1× (2026-10-28).
 
 **A bit or enum value has one owner.**
