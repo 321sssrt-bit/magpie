@@ -85,7 +85,7 @@ func TestCopilotDrawsItsImageModel(t *testing.T) {
 
 	s := New()
 	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json",
-		`{"model":"copilot/gpt-image-2.5-flare","prompt":"a magpie","size":"1024x1024","quality":"high","background":"transparent","output_format":"png"}`)
+		`{"model":"copilot/gpt-image-2.5-flare","prompt":"a magpie","size":"1024x1024","quality":"high","background":"transparent","output_format":"png","complexity":"high","frame_count":16,"frame_duration_ms":150}`)
 	if code != 200 || len(a.Data) != 1 {
 		t.Fatalf("%d %s", code, raw)
 	}
@@ -96,6 +96,11 @@ func TestCopilotDrawsItsImageModel(t *testing.T) {
 		!strings.Contains(sent, `"size":"1024x1024"`) || !strings.Contains(sent, `"quality":"high"`) ||
 		strings.Contains(sent, "background") || strings.Contains(sent, "output_format") {
 		t.Fatalf("asked %v %s", paths, sent)
+	}
+	for _, no := range []string{"complexity", "frame_count", "frame_duration_ms"} {
+		if strings.Contains(sent, no) {
+			t.Fatalf("Copilot was sent %s: %s", no, sent)
+		}
 	}
 	if sess != "Bearer sess" {
 		t.Fatalf("Authorization %q", sess)

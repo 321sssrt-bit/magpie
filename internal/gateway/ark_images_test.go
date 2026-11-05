@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/base64"
 	"mime/multipart"
 	"strings"
 	"testing"
@@ -39,6 +40,21 @@ func TestArkImagesPassOnTheirOwnFields(t *testing.T) {
 	}
 	if m := a.sent(t)[1]; m["watermark"] != true || m["sequential_image_generation"] != "auto" {
 		t.Fatalf("sent %v", m)
+	}
+	// Layer decomposition keeps its image and options without a prompt.
+	image := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+	for _, form := range []bool{false, true} {
+		fields := map[string]any{"model": "ark/doubao-seedream-4-5-251128", "image": image, "layer_decomposition": true}
+		ct, body := imageOptionsBody(t, fields, form)
+		if code, _, raw := postImages(t, s, "/v1/images/generations", ct, body); code != 200 {
+			t.Fatalf("layer decomposition (form %v): %d %s", form, code, raw)
+		}
+		sent := a.sent(t)
+		m := sent[len(sent)-1]
+		_, hasPrompt := m["prompt"]
+		if m["layer_decomposition"] != true || m["image"] != image || hasPrompt {
+			t.Fatalf("layer decomposition (form %v): sent %v", form, m)
+		}
 	}
 
 	// a stream is Ark's events, which this route doesn't give
