@@ -376,6 +376,8 @@ func (p picture) dataURL() string {
 // drawing is one images request, whichever shape it came in.
 type drawing struct {
 	Model, Prompt, Size, Quality, Background, Format string
+	Complexity                                       *string
+	FrameCount, FrameDurationMS                      *int
 	// Want is the response_format the caller asked for: with "b64_json"
 	// an image a vendor gave only a URL for is fetched (inline)
 	Want   string
@@ -661,6 +663,20 @@ func readDrawing(r *http.Request) (drawing, error) {
 		}
 		d.Model, d.Prompt, d.Size, d.Quality, d.Background, d.Format, d.Want = get("model"), get("prompt"), get("size"), get("quality"), get("background"), get("output_format"), get("response_format")
 		d.N, _ = strconv.Atoi(get("n"))
+		if len(f.Value["complexity"]) > 0 {
+			v := get("complexity")
+			d.Complexity = &v
+		}
+		for k, dst := range map[string]**int{"frame_count": &d.FrameCount, "frame_duration_ms": &d.FrameDurationMS} {
+			if len(f.Value[k]) == 0 {
+				continue
+			}
+			n, err := strconv.Atoi(get(k))
+			if err != nil {
+				return d, fmt.Errorf("%s must be an integer", k)
+			}
+			*dst = &n
+		}
 		for _, k := range []string{"image", "image[]"} {
 			for _, fh := range f.File[k] {
 				pic, err := readPart(fh)
@@ -683,22 +699,26 @@ func readDrawing(r *http.Request) (drawing, error) {
 			return d, err
 		}
 		var in struct {
-			Model          string          `json:"model"`
-			Prompt         string          `json:"prompt"`
-			Size           string          `json:"size"`
-			Quality        string          `json:"quality"`
-			Background     string          `json:"background"`
-			Format         string          `json:"output_format"`
-			N              int             `json:"n"`
-			Image          json.RawMessage `json:"image"`
-			Images         json.RawMessage `json:"images"`
-			Mask           json.RawMessage `json:"mask"`
-			ResponseFormat string          `json:"response_format"`
+			Model           string          `json:"model"`
+			Prompt          string          `json:"prompt"`
+			Size            string          `json:"size"`
+			Quality         string          `json:"quality"`
+			Background      string          `json:"background"`
+			Format          string          `json:"output_format"`
+			N               int             `json:"n"`
+			Complexity      *string         `json:"complexity"`
+			FrameCount      *int            `json:"frame_count"`
+			FrameDurationMS *int            `json:"frame_duration_ms"`
+			Image           json.RawMessage `json:"image"`
+			Images          json.RawMessage `json:"images"`
+			Mask            json.RawMessage `json:"mask"`
+			ResponseFormat  string          `json:"response_format"`
 		}
 		if err := json.Unmarshal(body, &in); err != nil {
 			return d, fmt.Errorf("the request isn't JSON: %v", err)
 		}
-		d = drawing{Model: in.Model, Prompt: in.Prompt, Size: in.Size, Quality: in.Quality, Background: in.Background, Format: in.Format, Want: strings.TrimSpace(in.ResponseFormat), N: in.N}
+		d = drawing{Model: in.Model, Prompt: in.Prompt, Size: in.Size, Quality: in.Quality, Background: in.Background, Format: in.Format, Want: strings.TrimSpace(in.ResponseFormat), N: in.N,
+			Complexity: in.Complexity, FrameCount: in.FrameCount, FrameDurationMS: in.FrameDurationMS}
 		for _, raw := range []json.RawMessage{in.Image, in.Images} {
 			for _, src := range imageSources(raw) {
 				pic, err := pictureOf(src)
@@ -715,6 +735,15 @@ func readDrawing(r *http.Request) (drawing, error) {
 			}
 			d.Mask = &pic
 		}
+	}
+	if d.Complexity != nil && !slices.Contains([]string{"low", "medium", "high"}, *d.Complexity) {
+		return d, errors.New("complexity must be low, medium or high")
+	}
+	if d.FrameCount != nil && *d.FrameCount < 2 {
+		return d, errors.New("frame_count must be at least 2")
+	}
+	if d.FrameDurationMS != nil && *d.FrameDurationMS < 20 {
+		return d, errors.New("frame_duration_ms must be at least 20")
 	}
 	d.Model = strings.TrimSpace(d.Model)
 	if strings.TrimSpace(d.Prompt) == "" {
@@ -1230,9 +1259,27 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 	var body []byte
 	var ct, url string
 	m := strings.ToLower(model)
+	req := map[string]any{"model": model, "prompt": d.Prompt, "n": d.N}
+	if !drawsGrok(p) {
+		for k, v := range map[string]string{"size": d.Size, "quality": d.Quality, "background": d.Background, "output_format": d.Format} {
+			if v != "" {
+				req[k] = v
+			}
+		}
+		if !senseNovaDrawer(m) {
+			if d.Complexity != nil {
+				req["complexity"] = *d.Complexity
+			}
+			for k, v := range map[string]*int{"frame_count": d.FrameCount, "frame_duration_ms": d.FrameDurationMS} {
+				if v != nil {
+					req[k] = *v
+				}
+			}
+		}
+	}
 	if drawsGrok(p) {
 		// Grok's Imagine API takes an aspect ratio, not a size or a quality
-		req := map[string]any{"model": model, "prompt": d.Prompt, "n": d.N, "response_format": "b64_json"}
+		req["response_format"] = "b64_json"
 		if ar := aspectAmong(d.Size, grokAspects); ar != "" {
 			req["aspect_ratio"] = ar
 		}
@@ -1248,12 +1295,6 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 		}
 		body, _ = json.Marshal(req)
 	} else if len(d.Images) == 0 {
-		req := map[string]any{"model": model, "prompt": d.Prompt, "n": d.N}
-		for k, v := range map[string]string{"size": d.Size, "quality": d.Quality, "background": d.Background, "output_format": d.Format} {
-			if v != "" {
-				req[k] = v
-			}
-		}
 		// only dall-e gives a URL unless asked; gpt-image turns the field away
 		if strings.Contains(m, "dall-e") || senseNovaDrawer(m) {
 			req["response_format"] = "b64_json"
@@ -1264,14 +1305,8 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 		// ChatGPT's backend takes an edit only as JSON, each image a data URL;
 		// so does SenseNova's for its U1 models, which answer in a URL unless
 		// asked for base64
-		req := map[string]any{"model": model, "prompt": d.Prompt, "n": d.N}
 		if senseNovaDrawer(m) {
 			req["response_format"] = "b64_json"
-		}
-		for k, v := range map[string]string{"size": d.Size, "quality": d.Quality, "background": d.Background, "output_format": d.Format} {
-			if v != "" {
-				req[k] = v
-			}
 		}
 		var imgs []map[string]string
 		for _, pic := range d.Images {
@@ -1286,10 +1321,8 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 	} else {
 		var buf bytes.Buffer
 		mw := multipart.NewWriter(&buf)
-		for k, v := range map[string]string{"model": model, "prompt": d.Prompt, "n": strconv.Itoa(d.N), "size": d.Size, "quality": d.Quality, "background": d.Background, "output_format": d.Format} {
-			if v != "" {
-				mw.WriteField(k, v)
-			}
+		for k, v := range req {
+			mw.WriteField(k, fmt.Sprint(v))
 		}
 		if strings.Contains(m, "dall-e") {
 			mw.WriteField("response_format", "b64_json")

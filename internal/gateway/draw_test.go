@@ -1,11 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -124,6 +126,227 @@ func TestImagesAPIModelDraws(t *testing.T) {
 	}
 }
 
+// imageOptionsBody uses the same fields in JSON and in an edits form.
+func imageOptionsBody(t *testing.T, fields map[string]any, form bool) (string, string) {
+	t.Helper()
+	if !form {
+		b, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "application/json", string(b)
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for k, v := range fields {
+		if k == "image" {
+			part, err := mw.CreateFormFile("image", "avatar.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := part.Write(pngBytes); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := mw.WriteField(k, fmt.Sprint(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return mw.FormDataContentType(), buf.String()
+}
+
+func TestImagesNativeOptionsReachVendor(t *testing.T) {
+	for _, route := range []struct {
+		name              string
+		edit, form, codex bool
+	}{
+		{name: "generations_json"},
+		{name: "edits_json", edit: true},
+		{name: "edits_multipart", edit: true, form: true},
+		{name: "codex_generations_json", codex: true},
+		{name: "codex_edits_json", edit: true, codex: true},
+		{name: "codex_edits_multipart", edit: true, form: true, codex: true},
+	} {
+		for _, options := range []struct {
+			name   string
+			fields map[string]any
+		}{
+			{"all", map[string]any{"complexity": "high", "frame_count": 16, "frame_duration_ms": 150}},
+			{"omitted", nil},
+			{"null", map[string]any{"complexity": nil, "frame_count": nil, "frame_duration_ms": nil}},
+			{"complexity_only", map[string]any{"complexity": "low"}},
+			{"frame_count_only", map[string]any{"frame_count": 2}},
+			{"frame_duration_only", map[string]any{"frame_duration_ms": 20}},
+		} {
+			if route.form && options.name == "null" {
+				continue
+			}
+			t.Run(route.name+"/"+options.name, func(t *testing.T) {
+				if route.codex {
+					codexSignedIn(t)
+				} else {
+					fresh(t)
+				}
+				type request struct{ path, ct, body string }
+				sent := make(chan request, 1)
+				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !strings.Contains(r.URL.Path, "/images/") {
+						http.NotFound(w, r)
+						return
+					}
+					b, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(400)
+						return
+					}
+					sent <- request{r.URL.Path, r.Header.Get("Content-Type"), string(b)}
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, `{"data":[{"b64_json":"`+base64.StdEncoding.EncodeToString(pngBytes)+`"}]}`)
+				}))
+				t.Cleanup(up.Close)
+				const model = "gpt-image-2.6-sunburst"
+				id, prefix := "art/", "/v1"
+				if route.codex {
+					id, prefix = "codex/", "/backend-api/codex"
+					was := provider.CodexBase
+					provider.CodexBase = up.URL + prefix
+					t.Cleanup(func() { provider.CodexBase = was })
+				} else {
+					p := provider.Provider{ID: "art", Name: "Art", Chat: up.URL + prefix, Key: "key", Models: []string{model}}
+					if err := provider.Save(p); err != nil {
+						t.Fatal(err)
+					}
+					if err := catalog.SaveLive("art", up.URL+prefix, []catalog.Model{{ID: model}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fields := map[string]any{"model": id + model, "prompt": "animate this avatar", "output_format": "gif"}
+				for k, v := range options.fields {
+					fields[k] = v
+				}
+				path := "/images/generations"
+				if route.edit {
+					path = "/images/edits"
+					fields["image"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+				}
+				ct, body := imageOptionsBody(t, fields, route.form)
+				code, answer, raw := postImages(t, New(), "/v1"+path, ct, body)
+				if code != 200 || len(answer.Data) != 1 {
+					t.Fatalf("%d %s", code, raw)
+				}
+				var wire request
+				select {
+				case wire = <-sent:
+				default:
+					t.Fatal("no images request reached the vendor")
+				}
+				if wire.path != prefix+path {
+					t.Fatalf("vendor path %q", wire.path)
+				}
+				multipartEdit := route.edit && !route.codex
+				if multipartEdit != strings.HasPrefix(wire.ct, "multipart/form-data") {
+					t.Fatalf("vendor content type %q", wire.ct)
+				}
+				var got map[string]any
+				if multipartEdit {
+					r := httptest.NewRequest("POST", wire.path, strings.NewReader(wire.body))
+					r.Header.Set("Content-Type", wire.ct)
+					if err := r.ParseMultipartForm(1 << 20); err != nil {
+						t.Fatal(err)
+					}
+					defer r.MultipartForm.RemoveAll()
+					got = map[string]any{}
+					for k, values := range r.MultipartForm.Value {
+						got[k] = values[0]
+					}
+					if len(r.MultipartForm.File["image"]) != 1 {
+						t.Fatal("edit image did not reach the vendor")
+					}
+				} else {
+					if wire.ct != "application/json" {
+						t.Fatalf("vendor content type %q", wire.ct)
+					}
+					if err := json.Unmarshal([]byte(wire.body), &got); err != nil {
+						t.Fatal(err)
+					}
+					if route.edit && !strings.Contains(wire.body, `"images":[{"image_url":"data:image/png;base64,`) {
+						t.Fatal("edit image did not reach the vendor")
+					}
+				}
+				for _, k := range []string{"complexity", "frame_count", "frame_duration_ms"} {
+					want, present := options.fields[k]
+					present = present && want != nil
+					value, exists := got[k]
+					if exists != present || present && fmt.Sprint(value) != fmt.Sprint(want) {
+						t.Errorf("vendor %s = %v (present %v), want %v (present %v)", k, value, exists, want, present)
+					}
+					if present && k != "complexity" && !multipartEdit {
+						if _, number := value.(float64); !number {
+							t.Errorf("vendor %s is %T, want a JSON number", k, value)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestImagesNativeOptionsRejectInvalid(t *testing.T) {
+	s, vendor := easeled(t)
+	for _, form := range []bool{false, true} {
+		for _, tc := range []struct {
+			field    string
+			value    any
+			jsonOnly bool
+		}{
+			{"complexity", "", false},
+			{"complexity", "ultra", false},
+			{"complexity", true, true},
+			{"frame_count", "16", true},
+			{"frame_count", 16.5, false},
+			{"frame_count", 0, false},
+			{"frame_count", -1, false},
+			{"frame_count", 1, false},
+			{"frame_count", true, false},
+			{"frame_count", "", false},
+			{"frame_count", json.Number("9223372036854775808"), false},
+			{"frame_duration_ms", "150", true},
+			{"frame_duration_ms", 150.5, false},
+			{"frame_duration_ms", 0, false},
+			{"frame_duration_ms", -1, false},
+			{"frame_duration_ms", 19, false},
+			{"frame_duration_ms", true, false},
+			{"frame_duration_ms", "", false},
+			{"frame_duration_ms", json.Number("9223372036854775808"), false},
+		} {
+			if form && tc.jsonOnly {
+				continue
+			}
+			t.Run(fmt.Sprintf("multipart=%v/%s=%v", form, tc.field, tc.value), func(t *testing.T) {
+				fields := map[string]any{"model": "art/gpt-image-1", "prompt": "animate this avatar", "output_format": "gif", tc.field: tc.value}
+				path := "/v1/images/generations"
+				if form {
+					path = "/v1/images/edits"
+					fields["image"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+				}
+				ct, body := imageOptionsBody(t, fields, form)
+				code, _, raw := postImages(t, s, path, ct, body)
+				if code != 400 || !strings.Contains(raw, tc.field) {
+					t.Errorf("invalid %s: %d %s", tc.field, code, raw)
+				}
+			})
+		}
+	}
+	for _, path := range []string{"/v1/images/generations", "/v1/images/edits"} {
+		if sent := vendor.got(path); len(sent) != 0 {
+			t.Errorf("invalid options reached %s (%d requests)", path, len(sent))
+		}
+	}
+}
+
 func TestChatModelDrawsWithModalities(t *testing.T) {
 	s, e := easeled(t)
 	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"art/painter-image-preview","prompt":"a magpie","size":"1536x1024","n":2}`)
@@ -137,13 +360,20 @@ func TestChatModelDrawsWithModalities(t *testing.T) {
 }
 
 func TestChatModelsGeminiPartsAreImages(t *testing.T) {
-	s, _ := easeled(t)
-	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"art/gemini-2.5-flash-image","prompt":"a magpie"}`)
+	s, e := easeled(t)
+	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"art/gemini-2.5-flash-image","prompt":"a magpie","complexity":"high","frame_count":16,"frame_duration_ms":150}`)
 	if code != 200 || len(a.Data) != 1 || a.Text != "Here you go!" {
 		t.Fatalf("%d %s", code, raw)
 	}
 	if b, _ := base64.StdEncoding.DecodeString(a.Data[0].B64); string(b) != string(pngBytes) {
 		t.Fatalf("image %q", b)
+	}
+	for _, sent := range e.got("/v1/chat/completions") {
+		for _, no := range []string{`"complexity"`, `"frame_count"`, `"frame_duration_ms"`} {
+			if strings.Contains(sent, no) {
+				t.Fatalf("Gemini chat was sent %s: %s", no, sent)
+			}
+		}
 	}
 }
 
@@ -617,12 +847,12 @@ func TestGrokDrawsSeveralAndIgnoresWhatItHasNoFieldFor(t *testing.T) {
 	up := newGrokMedia(t)
 	s := New()
 	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json",
-		`{"model":"grok/grok-imagine-image","prompt":"two magpies","n":2,"quality":"high","background":"transparent","output_format":"png","size":"1024x1024"}`)
+		`{"model":"grok/grok-imagine-image","prompt":"two magpies","n":2,"quality":"high","background":"transparent","output_format":"png","size":"1024x1024","complexity":"high","frame_count":16,"frame_duration_ms":150}`)
 	if code != 200 || len(a.Data) != 2 {
 		t.Fatalf("%d %s", code, raw)
 	}
 	sent := up.body("/v1/images/generations", 0)
-	for _, no := range []string{`"quality"`, `"background"`, `"output_format"`, `"size"`} {
+	for _, no := range []string{`"quality"`, `"background"`, `"output_format"`, `"size"`, `"complexity"`, `"frame_count"`, `"frame_duration_ms"`} {
 		if strings.Contains(sent, no) {
 			t.Fatalf("Grok was sent %s: %s", no, sent)
 		}

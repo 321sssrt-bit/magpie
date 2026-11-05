@@ -44,6 +44,29 @@ backfilled; see [Gateway Session Aggregation](gateway-sessions.md).
 | Vertex AI | A [Google Vertex AI provider](providers-accounts.md#responsibilities-and-sources-of-truth) speaks Gemini alone. A request goes to `<base>/publishers/google/models/<model>:streamGenerateContent?alt=sse` (`provider.VertexPath`, `upstreamPath`), the model named as the user's upstream name for it says (`UpstreamNameIn`, which the usage log's endpoint names too), with no `model` or `stream` field in its body (`passthrough`, `forwardOnce`, `geminiRequest`). A Gemini client's request is relayed as it came, its own `thinkingConfig`, `safetySettings` and the rest kept: streamed there, asked whole to `:generateContent` (`provider.VertexWholePath`), which answers one JSON body (Factory's rule of translating a whole request, as its route only streams, isn't Vertex AI's). Every other API's is translated (`buildFor`, `buildVertex`) and its stream read by `codeAssistDecoder`, which gives thought parts as reasoning, never as the answer's text. Effort: `vertexEffort` fits it to the model's levels, reasoning turned off going as `minimal` fitted the same way, and holds a model whose levels aren't known to `low`…`high`. `vertexThinking` sends Gemini 3 a `thinkingLevel` (`includeThoughts` false with reasoning off) and 2.5 a `thinkingBudget` in the model's range (`vertexBudgets`): turned off, the budget that stops its thinking, or Pro's least, as Pro can't stop. Thought signatures are every Gemini path's (#1445): a call's signature reaches the client in its id (`signedID`) and goes back on the call it came on, while a call with none in a step Vertex AI signed goes without; a step with nothing to give back has every call sent `skip_thought_signature_validator`. A 400 `Invalid thought signature.` is asked again with every call sent so (`withoutSignatures`), for that request only. A 400 refusing `minimal` (`geminiRefusedLevel`) is asked again at the model's lowest other level (`onEffort`), and `markUnfit(offRefused)` keeps that level until magpie restarts. Both retries are the translated path's. Vertex AI's own Google Search grounding isn't used: `searchHosts` names only `generativelanguage.googleapis.com` for Gemini, so magpie searches for it (`search.go`). | [`vertex.go`](../../internal/gateway/vertex.go), [`gateway.go`](../../internal/gateway/gateway.go), [`codeassist.go`](../../internal/gateway/codeassist.go), [`gemini.go`](../../internal/gateway/gemini.go), [`gemini_signature.go`](../../internal/gateway/gemini_signature.go), [`search.go`](../../internal/gateway/search.go) |
 | Bedrock Mantle | A request on chat completions or Responses to an [Amazon Bedrock Mantle provider](providers-accounts.md#responsibilities-and-sources-of-truth) goes to the prefix that serves its model (`mantleRoutes`, `provider.MantleBase` in `forwardOnce`): `/openai/v1` for OpenAI's closed GPTs and xAI's Grok, `/v1` for the rest. A model Mantle refuses there with "model `x` isn't supported on this route" (a maker the rule doesn't know yet) is asked once more at the other prefix, and when it is taken there that prefix is remembered for the model in `unfit` (`mantleRouteKey`) until the gateway restarts. A model refused at both gets the first refusal and nothing is remembered (`mantleReroute`). Messages go to `/anthropic` alone. | [`mantle.go`](../../internal/gateway/mantle.go), [`gateway.go`](../../internal/gateway/gateway.go) |
 
+The standard OpenAI Images path keeps the caller's `complexity`,
+`frame_count` and `frame_duration_ms` (`drawing`, `readDrawing`, `drawImages`
+in [`draw.go`](../../internal/gateway/draw.go)). Generations go as JSON;
+edits received as JSON or multipart carry the same options into the upstream
+multipart form, or JSON for Codex. JSON numbers stay numbers; form values
+are parsed as integers. Omitted or JSON `null` options stay absent upstream,
+so the vendor's defaults are unchanged. `complexity` accepts `low`, `medium`
+or `high`; a supplied frame count must be an integer of at least 2, and a
+frame delay an integer of at least 20 milliseconds. Wrong JSON types,
+empty or malformed form numbers, overflow and values below those minima
+return 400 naming the field before any vendor is asked. The vendor checks
+the model's GIF support, preview access, frame limits and encoded timing;
+magpie neither supplies defaults nor clamps or rounds these options
+([OpenAI Images reference](https://developers.openai.com/api/reference/resources/images/methods/generate.md)).
+
+These options are not added to Chat Completions or the dedicated Grok,
+Gemini/Code Assist, WorkBuddy, OpenRouter Images, ModelScope, Ark and
+SenseNova contracts. `TestImagesNativeOptionsReachVendor` observes the
+JSON and multipart bodies at a fake vendor for the standard and Codex paths,
+including individual options, omission and JSON nulls;
+`TestImagesNativeOptionsRejectInvalid` checks invalid inputs never reach it
+([`draw_test.go`](../../internal/gateway/draw_test.go)).
+
 ## Codex titles, descriptions, summaries and predictions
 
 Codex's title and description requests are independent hidden turns. The
